@@ -13,6 +13,8 @@ Files travel directly between computers on your private Tailscale network. Drop 
 No install required. Just download and run.
 
 > **Windows SmartScreen warning:** Click "More info" → "Run anyway". The app is unsigned but safe.
+>
+> **VirusTotal:** [2/67 engines flag this as a false positive](https://www.virustotal.com/gui/file/4b34964514529d857b19b6009158dea37b3d9276d12f24cb709ae6f75ea52c46/detection) — a known issue with PyInstaller-bundled apps. All major engines (Windows Defender, Avast, BitDefender, CrowdStrike, etc.) report clean.
 
 ---
 
