@@ -1,0 +1,17 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# App data
+.droprun/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
