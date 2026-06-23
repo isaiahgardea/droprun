@@ -11,6 +11,12 @@ __pycache__/
 # App data
 .droprun/
 
+# Media / large assets
+*.mp4
+*.mov
+*.avi
+*.mkv
+
 # OS
 Thumbs.db
 desktop.ini
