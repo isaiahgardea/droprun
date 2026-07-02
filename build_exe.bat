@@ -30,6 +30,15 @@ if %errorlevel% neq 0 (
 echo  [2/3] Building executable (this takes 2-4 minutes)...
 cd /d "%~dp0"
 
+:: Kill any running instance so the exe file isn't locked by Windows
+taskkill /F /IM Droprun.exe >nul 2>&1
+
+:: Give Windows a moment to release the file lock before we delete it
+timeout /t 1 /nobreak >nul 2>&1
+
+:: Delete the old exe FIRST so a failed build can never masquerade as success
+if exist "dist\Droprun.exe" del /F /Q "dist\Droprun.exe"
+
 python -m PyInstaller ^
   --onefile ^
   --windowed ^
@@ -41,10 +50,19 @@ python -m PyInstaller ^
   --collect-all webview ^
   --noconfirm ^
   fileshare_desktop.py
+set "BUILD_RC=%errorlevel%"
 
 echo.
+if not "%BUILD_RC%"=="0" (
+    echo  [3/3] BUILD FAILED -- PyInstaller exited with code %BUILD_RC%.
+    echo  Scroll up for the actual error. The old exe was deleted, so
+    echo  nothing stale remains to accidentally run.
+    echo.
+    pause
+    exit /b 1
+)
 if exist "dist\Droprun.exe" (
-    echo  [3/3] Done!
+    echo  [3/3] Done! A FRESH Droprun.exe was built successfully.
     echo.
     echo  ============================================
     echo   Droprun.exe is ready in the dist\ folder
@@ -53,7 +71,11 @@ if exist "dist\Droprun.exe" (
     echo.
     start "" "%~dp0dist"
 ) else (
-    echo  [3/3] Build may have failed -- check output above for errors.
+    echo  [3/3] BUILD FAILED -- PyInstaller returned 0 but produced no exe.
+    echo  Scroll up for details.
+    echo.
+    pause
+    exit /b 1
 )
 
 pause

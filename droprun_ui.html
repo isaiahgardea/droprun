@@ -82,12 +82,14 @@ header{background:var(--header-glass);backdrop-filter:blur(14px);-webkit-backdro
 #ts-banner .msg{font-size:12px;color:var(--muted);flex:1}
 #ts-banner .msg strong{color:var(--text)}
 .bts{background:var(--yellow);color:#000;border:none;border-radius:5px;padding:4px 11px;font-size:11px;font-weight:700;cursor:pointer;flex-shrink:0}
+.bt-mini{background:transparent;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer;flex-shrink:0;transition:border-color .15s,background .15s}
+.bt-mini:hover{border-color:var(--accent);background:rgba(108,142,245,.10)}
 .upzone{border:2px dashed var(--border);border-radius:var(--r);padding:26px 18px;text-align:center;cursor:pointer;transition:border-color .15s,background .15s;margin-bottom:20px;position:relative;background:rgba(0,0,0,.12)}
 .upzone:hover,.upzone.drag{border-color:var(--accent);background:rgba(108,142,245,.07)}
 .uico{font-size:26px;margin-bottom:5px}
 .utxt{color:var(--muted);font-size:12px}
 .utxt strong{color:var(--text)}
-#file-input{position:absolute;inset:0;opacity:0;cursor:pointer}
+#file-input{position:absolute;inset:0;opacity:0;cursor:pointer;pointer-events:none}
 #up-status{margin-top:7px;font-size:11px;color:var(--muted);display:none}
 #pbar-wrap{background:var(--border);border-radius:4px;height:4px;margin-top:5px;overflow:hidden;display:none}
 #pbar{height:100%;background:var(--accent);width:0%;transition:width .1s;border-radius:4px}
@@ -391,6 +393,10 @@ header{background:var(--header-glass);backdrop-filter:blur(14px);-webkit-backdro
       </div>
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
         <div class="sec-title" style="margin:0">Shared Files</div>
+        <div style="display:flex;gap:8px">
+          <button class="bt-mini" onclick="openShareFolder()" title="Open the share folder in File Explorer">&#128193; Open Folder</button>
+          <button class="bt-mini" onclick="loadFiles()" title="Refresh the file list">&#8635; Refresh</button>
+        </div>
       </div>
       <div class="toolbar">
         <input class="search-in" id="local-search" placeholder="&#128269; Search files..." oninput="renderLocalFiles()">
@@ -895,7 +901,21 @@ function loadPeerFiles(ip){
     })
     .catch(function(){
       overlay.className='error';
-      overlay.querySelector('.fo-msg').textContent='Could not reach '+(_currentPeer?_currentPeer.name:'peer');
+      var nm=_currentPeer?_currentPeer.name:'peer';
+      var el=overlay.querySelector('.fo-msg');
+      el.textContent='Could not reach '+nm+' — checking why...';
+      // Ask our backend to tell offline apart from app-not-running/firewall.
+      fetch('/api/probe?ip='+encodeURIComponent(ip)).then(function(r){return r.json();}).then(function(pr){
+        if(pr&&pr.port_open){
+          el.textContent=nm+' is reachable now — click to try again.';
+        } else if(pr&&pr.device_online){
+          el.textContent=nm+"'s device is online, but Droprun isn't running there (or their firewall is blocking port 8765). Ask them to open Droprun.";
+        } else {
+          el.textContent=nm+' appears offline — their device is not reachable on Tailscale right now.';
+        }
+      }).catch(function(){
+        el.textContent='Could not reach '+nm+'.';
+      });
     });
 }
 
@@ -1210,6 +1230,51 @@ upzone.addEventListener('dragover',function(e){e.preventDefault();upzone.classLi
 upzone.addEventListener('dragleave',function(){upzone.classList.remove('drag');});
 upzone.addEventListener('drop',function(e){e.preventDefault();upzone.classList.remove('drag');upload(e.dataTransfer.files);});
 finput.addEventListener('change',function(){upload(finput.files);});
+upzone.addEventListener('click',function(){uploadNative();});
+
+function openShareFolder(){
+  function fail(err){toast('Could not open folder'+(err&&err.error?': '+err.error:''),'err');}
+  if(window.pywebview&&window.pywebview.api&&window.pywebview.api.open_share_folder){
+    window.pywebview.api.open_share_folder().then(function(r){if(!r||!r.ok)fail(r);}).catch(fail);
+    return;
+  }
+  fetch('/api/open-folder',{method:'POST'}).then(function(r){return r.json();})
+    .then(function(r){if(!r||!r.ok)fail(r);}).catch(fail);
+}
+
+function uploadNative(){
+  const st=document.getElementById('up-status');
+  const bw=document.getElementById('pbar-wrap');
+  st.textContent='Selecting files...'; st.style.display='block'; if(bw) bw.style.display='none';
+
+  function done(r){
+    st.style.display='none';
+    if(!r||r.cancelled){toast('No files selected');return;}
+    if(!r.ok){toast('Upload error: '+(r.error||'unknown'),'err');return;}
+    if(r.saved&&r.saved.length) toast('Added '+r.saved.length+' file(s)');
+    else toast('No files were copied','err');
+    if(r.errors&&r.errors.length) r.errors.forEach(function(x){toast('Failed: '+x.name+' ('+x.error+')','err');});
+    loadFiles();
+  }
+  function fail(err){st.style.display='none';toast('Upload error: '+(err&&err.message?err.message:String(err)),'err');}
+
+  // Prefer the pywebview JS API (native dialog on the desktop main thread).
+  // window.pywebview.api may not be injected the instant of the click, so retry.
+  let tries=0;
+  (function tryApi(){
+    if(window.pywebview&&window.pywebview.api&&window.pywebview.api.pick_and_upload_files){
+      window.pywebview.api.pick_and_upload_files().then(done).catch(fail);
+      return;
+    }
+    if(tries++<20){ setTimeout(tryApi,100); return; }
+    // Fallback: HTTP endpoint (browser-only mode, no pywebview)
+    const pin=sessionStorage.getItem('fs_pin');
+    const h={'Content-Type':'application/json'};
+    if(pin) h['X-Pin']=pin;
+    fetch('/api/pick-files',{method:'POST',headers:h,body:'{}'})
+      .then(function(r){return r.json();}).then(done).catch(fail);
+  })();
+}
 
 function upload(files){
   if(!files.length) return;

@@ -326,6 +326,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif p == "/api/files":
             self._json(list_files())
 
+        elif p == "/api/probe":
+            ip = qs.get("ip", [""])[0].strip()
+            if not ip:
+                self._json({"error": "no ip"}, 400)
+            else:
+                self._json(probe_peer(ip))
+
         elif p == "/api/messages":
             peer = qs.get("peer", [None])[0]
             self._json(_get_messages(peer) if peer else [])
@@ -375,9 +382,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._html(b"<h1>Not found</h1>", 404)
 
     def do_POST(self):
-        p      = urllib.parse.urlparse(self.path).path
-        length = int(self.headers.get("Content-Length", 0))
-        body   = self.rfile.read(length)
+        p = urllib.parse.urlparse(self.path).path
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body   = self.rfile.read(length)
+        except Exception:
+            body = b""
 
         if p == "/api/auth":
             try: payload = json.loads(body)
@@ -420,6 +430,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"ok": True})
             except Exception as e:
                 self._json({"ok": False, "error": str(e)})
+
+        elif p == "/api/open-folder":
+            try:
+                SHARE_DIR.mkdir(parents=True, exist_ok=True)
+                os.startfile(str(SHARE_DIR))
+                self._json({"ok": True})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+
+        elif p == "/api/pick-files":
+            # Browser-only fallback (desktop app uses the pywebview JS API).
+            # PowerShell dialog is safe from a worker thread; tkinter is not.
+            try:
+                import shutil as _sh2
+                SHARE_DIR.mkdir(parents=True, exist_ok=True)
+                ps = (
+                    "Add-Type -AssemblyName System.Windows.Forms;"
+                    "$owner=New-Object System.Windows.Forms.Form;"
+                    "$owner.TopMost=$true;"
+                    "$d=New-Object System.Windows.Forms.OpenFileDialog;"
+                    "$d.Multiselect=$true;$d.Title='Select files to share';"
+                    "if($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK)"
+                    "{$d.FileNames -join \"`n\"}"
+                )
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                    capture_output=True, text=True, creationflags=NO_WINDOW,
+                )
+                file_paths = [x.strip() for x in r.stdout.strip().splitlines() if x.strip()] if r.stdout else []
+                if not file_paths:
+                    self._json({"ok": False, "cancelled": True}); return
+                saved, errors = [], []
+                for src_path in file_paths:
+                    try:
+                        src = Path(src_path); dest = SHARE_DIR / src.name
+                        if src.resolve() != dest.resolve():
+                            _sh2.copy2(str(src), str(dest))
+                            _log_transfer("received", src.name, src.stat().st_size, "local")
+                        saved.append(src.name)
+                    except Exception as copy_e:
+                        errors.append({"name": Path(src_path).name, "error": str(copy_e)})
+                self._json({"ok": True, "saved": saved, "errors": errors})
+            except Exception as e:
+                self._json({"error": str(e)}, 500)
 
         elif p == "/api/settings":
             try: data = json.loads(body)
@@ -477,6 +531,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self._json({"error": "Not found"}, 404)
 
+# ── Connectivity / firewall helpers ─────────────────────────────────────────────
+def probe_peer(ip):
+    """Diagnose why a peer can't be reached.
+    device_online = host answers ICMP ping (reachable on the tailnet)
+    port_open     = the Droprun app is listening on PORT (TCP connect succeeds)"""
+    port_open = False
+    try:
+        with socket.create_connection((ip, PORT), timeout=2):
+            port_open = True
+    except Exception:
+        port_open = False
+    device_online = False
+    try:
+        if sys.platform == "win32":
+            cmd = ["ping", "-n", "1", "-w", "1500", ip]
+        else:
+            cmd = ["ping", "-c", "1", "-W", "2", ip]
+        r = subprocess.run(cmd, capture_output=True, text=True, creationflags=NO_WINDOW)
+        device_online = (r.returncode == 0)
+    except Exception:
+        device_online = False
+    return {"ip": ip, "device_online": device_online, "port_open": port_open}
+
+
+def ensure_firewall_rule():
+    """Best-effort Windows Firewall inbound allow rule for the app port so peers
+    can reach us. Succeeds when the app is run elevated; otherwise fails quietly
+    (Windows may still prompt to allow the app on first bind). Idempotent."""
+    if sys.platform != "win32":
+        return
+    rule_name = f"Droprun (TCP {PORT})"
+    try:
+        chk = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"],
+            capture_output=True, text=True, creationflags=NO_WINDOW,
+        )
+        if chk.returncode == 0:
+            return  # rule already exists
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule",
+             f"name={rule_name}", "dir=in", "action=allow",
+             "protocol=TCP", f"localport={PORT}"],
+            capture_output=True, text=True, creationflags=NO_WINDOW,
+        )
+    except Exception:
+        pass
+
+
 # ── Server ────────────────────────────────────────────────────────────────────
 def run_server():
     with http.server.ThreadingHTTPServer(("", PORT), Handler) as srv:
@@ -509,6 +611,96 @@ class JsApi:
                 return r.stdout.strip()
             except Exception:
                 return ""
+
+    def pick_and_upload_files(self):
+        """Open a native file dialog (on the pywebview main thread) and copy the
+        selected files into SHARE_DIR. Uses webview's own dialog API — no tkinter
+        (which crashes worker threads) — with a PowerShell fallback."""
+        global _webview_window
+        import traceback as _tb, datetime as _dt
+        _log_path = Path.home() / ".droprun" / "debug.log"
+        try:
+            _log_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        def _log(msg):
+            try:
+                with open(_log_path, "a", encoding="utf-8") as f:
+                    f.write(f"[{_dt.datetime.now().isoformat()}] {msg}\n")
+            except Exception:
+                pass
+
+        _log("pick_and_upload_files called")
+        file_paths = []
+
+        # 1. pywebview native dialog (correct, thread-safe on the GUI thread).
+        try:
+            import webview as _wv
+            _log("trying webview.create_file_dialog...")
+            result = _webview_window.create_file_dialog(_wv.OPEN_DIALOG, allow_multiple=True)
+            _log(f"webview dialog result: {result!r}")
+            if result:
+                file_paths = list(result)
+        except Exception as e:
+            _log(f"webview dialog failed: {e}\n{_tb.format_exc()}")
+
+        # 2. Fallback: PowerShell OpenFileDialog.
+        if not file_paths:
+            try:
+                ps = (
+                    "Add-Type -AssemblyName System.Windows.Forms;"
+                    "$owner=New-Object System.Windows.Forms.Form;"
+                    "$owner.TopMost=$true;"
+                    "$d=New-Object System.Windows.Forms.OpenFileDialog;"
+                    "$d.Multiselect=$true;$d.Title='Select files to share';"
+                    "if($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK)"
+                    "{$d.FileNames -join \"`n\"}"
+                )
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                    capture_output=True, text=True, creationflags=NO_WINDOW,
+                )
+                _log(f"powershell rc={r.returncode} stdout={r.stdout!r}")
+                if r.stdout and r.stdout.strip():
+                    file_paths = [p.strip() for p in r.stdout.strip().splitlines() if p.strip()]
+            except Exception as e:
+                _log(f"powershell failed: {e}\n{_tb.format_exc()}")
+
+        _log(f"file_paths resolved: {file_paths!r}")
+        if not file_paths:
+            return {"ok": False, "cancelled": True}
+
+        import shutil
+        SHARE_DIR.mkdir(parents=True, exist_ok=True)
+        saved, errors = [], []
+        for src_path in file_paths:
+            try:
+                src = Path(src_path)
+                dest = SHARE_DIR / src.name
+                if src.resolve() == dest.resolve():
+                    saved.append(src.name)
+                    _log(f"already in share dir: {src.name}")
+                    continue
+                shutil.copy2(str(src), str(dest))
+                saved.append(src.name)
+                _log_transfer("received", src.name, src.stat().st_size, "local")
+            except Exception as e:
+                errors.append({"name": Path(src_path).name, "error": str(e)})
+                _log(f"copy error: {e}")
+        if saved:
+            threading.Thread(target=notify,
+                args=("Droprun", "Added: " + ", ".join(saved)), daemon=True).start()
+        _log(f"done: saved={saved} errors={errors}")
+        return {"ok": True, "saved": saved, "errors": errors}
+
+    def open_share_folder(self):
+        """Open the share directory in the OS file explorer."""
+        try:
+            SHARE_DIR.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(SHARE_DIR))
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def open_help(self):
         try:
@@ -560,6 +752,7 @@ def main():
     global _webview_window
     load_settings()
     SHARE_DIR.mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=ensure_firewall_rule, daemon=True).start()
     threading.Thread(target=run_server, daemon=True).start()
     time.sleep(0.5)
 
