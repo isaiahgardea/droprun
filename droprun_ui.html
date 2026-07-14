@@ -957,57 +957,37 @@ function downloadFromPeer(ip,filename,totalBytes){
   const key=fkey(filename);
   const btn=document.getElementById('dl-'+key);
   const barWrap=document.getElementById('dlbar-'+key);
-  const bar=barWrap?barWrap.querySelector('.dl-bar'):null;
   const lbl=document.getElementById('dllbl-'+key);
   if(btn) btn.disabled=true;
-  if(barWrap){barWrap.style.display='block';}
-  if(lbl){lbl.style.display='block';lbl.textContent='Starting...';}
+  if(barWrap) barWrap.style.display='block';
+  if(lbl){lbl.style.display='block';lbl.textContent='Downloading...';}
 
-  const controller=new AbortController();
-  _activeDownloads[filename]=controller;
+  const pin=sessionStorage.getItem('fs_pin');
+  const h={'Content-Type':'application/json'};
+  if(pin) h['X-Pin']=pin;
 
-  fetch('http://'+ip+':8765/files/'+encodeURIComponent(filename),{signal:controller.signal})
-    .then(function(resp){
-      if(!resp.ok) throw new Error('HTTP '+resp.status);
-      const total=totalBytes||parseInt(resp.headers.get('Content-Length')||'0')||0;
-      const reader=resp.body.getReader();
-      const chunks=[];
-      let received=0;
-      function pump(){
-        return reader.read().then(function(ref){
-          const done=ref.done, value=ref.value;
-          if(done){
-            const blob=new Blob(chunks);
-            const url=URL.createObjectURL(blob);
-            const a=document.createElement('a');
-            a.href=url; a.download=filename;
-            document.body.appendChild(a); a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-            fetch('/api/log-transfer',{method:'POST',headers:{'Content-Type':'application/json'},
-              body:JSON.stringify({direction:'downloaded',name:filename,bytes:received,peer:ip})}).catch(function(){});
-            toast('Downloaded '+filename,'ok');
-            if(btn){btn.disabled=false;btn.innerHTML='&#10003; Done';}
-            if(barWrap){barWrap.style.display='none';}
-            if(lbl){lbl.style.display='none';}
-            delete _activeDownloads[filename];
-            return;
-          }
-          chunks.push(value); received+=value.length;
-          if(total>0&&bar) bar.style.width=Math.round(received/total*100)+'%';
-          if(lbl) lbl.textContent=formatSize(received)+(total?' / '+formatSize(total):'');
-          return pump();
-        });
+  // Server-side fetch: our local Python backend downloads the file from the peer
+  // and saves it directly to SHARE_DIR — avoids WebView2 blob/a.download quirks.
+  fetch('/api/fetch-from-peer',{method:'POST',headers:h,
+    body:JSON.stringify({ip:ip,filename:filename})})
+    .then(function(r){return r.json();})
+    .then(function(r){
+      if(r.ok){
+        toast('Saved to your FileShare: '+filename,'ok');
+        if(btn){btn.disabled=false;btn.innerHTML='&#10003; Saved';}
+        loadFiles();
+      } else {
+        toast('Download failed: '+(r.error||'unknown'),'err');
+        if(btn){btn.disabled=false;btn.innerHTML='&#11015; Download';}
       }
-      return pump();
+      if(barWrap) barWrap.style.display='none';
+      if(lbl) lbl.style.display='none';
     })
     .catch(function(e){
-      if(e.name==='AbortError'){toast('Download cancelled','err');}
-      else{toast('Download failed: '+filename,'err');}
+      toast('Download failed: '+(e&&e.message?e.message:String(e)),'err');
       if(btn){btn.disabled=false;btn.innerHTML='&#11015; Download';}
       if(barWrap) barWrap.style.display='none';
       if(lbl) lbl.style.display='none';
-      delete _activeDownloads[filename];
     });
 }
 

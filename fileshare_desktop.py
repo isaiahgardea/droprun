@@ -415,6 +415,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ).start()
             self._json({"ok": True, "saved": saved})
 
+        elif p == "/api/fetch-from-peer":
+            if not self._auth(): self._json({"error": "Unauthorized"}, 401); return
+            try:
+                payload  = json.loads(body)
+                peer_ip  = payload.get("ip", "").strip()
+                filename = Path(payload.get("filename", "")).name
+                if not peer_ip or not filename:
+                    self._json({"error": "Missing ip or filename"}, 400); return
+                import urllib.request as _ur
+                url  = f"http://{peer_ip}:{PORT}/files/{urllib.parse.quote(filename)}"
+                SHARE_DIR.mkdir(parents=True, exist_ok=True)
+                dest = SHARE_DIR / filename
+                _ur.urlretrieve(url, str(dest))
+                size = dest.stat().st_size
+                _log_transfer("downloaded", filename, size, peer_ip)
+                threading.Thread(target=notify,
+                    args=("Droprun", f"Downloaded: {filename}"), daemon=True).start()
+                self._json({"ok": True, "saved": filename})
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self._json({"error": str(e)}, 500)
+
         elif p == "/api/delete":
             if not self._auth(): self._json({"error": "Unauthorized"}, 401); return
             try: payload = json.loads(body)
@@ -769,6 +791,7 @@ def main():
         )
         _wv_storage = str(Path.home() / ".droprun" / "webview")
         webview.start(debug=False, icon=icon_str, storage_path=_wv_storage)
+        os._exit(0)   # window closed — kill process so port 8765 is freed
     except TypeError:
         import webview
         api = JsApi()
@@ -779,6 +802,7 @@ def main():
         )
         _wv_storage = str(Path.home() / ".droprun" / "webview")
         webview.start(debug=False, storage_path=_wv_storage)
+        os._exit(0)
     except ImportError:
         import webbrowser
         webbrowser.open(f"http://localhost:{PORT}")

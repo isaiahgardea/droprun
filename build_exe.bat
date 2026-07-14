@@ -16,9 +16,10 @@ if %errorlevel% neq 0 (
     pause
     exit /b 1
 )
+set "PY=python"
 
 echo  [1/3] Installing dependencies...
-pip install pywebview pyinstaller --quiet
+%PY% -m pip install pywebview pyinstaller --quiet
 if %errorlevel% neq 0 (
     echo.
     echo  ERROR: Failed to install dependencies.
@@ -39,7 +40,7 @@ timeout /t 1 /nobreak >nul 2>&1
 :: Delete the old exe FIRST so a failed build can never masquerade as success
 if exist "dist\Droprun.exe" del /F /Q "dist\Droprun.exe"
 
-python -m PyInstaller ^
+%PY% -m PyInstaller ^
   --onefile ^
   --windowed ^
   --name Droprun ^
